@@ -307,6 +307,53 @@ export function issueRoutes(db: Db, storage: StorageService) {
     const mentionedProjects = mentionedProjectIds.length > 0
       ? await projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
       : [];
+    if ((req.query.view as string | undefined) === "agent") {
+      const slimAncestors = ancestors.map((ancestor) => ({
+        id: ancestor.id,
+        identifier: ancestor.identifier,
+        title: ancestor.title,
+        status: ancestor.status,
+        parentId: ancestor.parentId,
+      }));
+      const slimProject = project
+        ? {
+          id: project.id,
+          name: project.name,
+          status: project.status,
+          urlKey: project.urlKey,
+          primaryWorkspace: project.primaryWorkspace
+            ? {
+              id: project.primaryWorkspace.id,
+              name: project.primaryWorkspace.name,
+              cwd: project.primaryWorkspace.cwd,
+            }
+            : null,
+        }
+        : null;
+      const slimGoal = goal
+        ? {
+          id: goal.id,
+          title: goal.title,
+          status: goal.status,
+          level: goal.level,
+          ownerAgentId: goal.ownerAgentId,
+        }
+        : null;
+      const slimMentionedProjects = mentionedProjects.map((mentionedProject) => ({
+        id: mentionedProject.id,
+        name: mentionedProject.name,
+        status: mentionedProject.status,
+        urlKey: mentionedProject.urlKey,
+      }));
+      res.json({
+        ...issue,
+        ancestors: slimAncestors,
+        project: slimProject,
+        goal: slimGoal,
+        mentionedProjects: slimMentionedProjects,
+      });
+      return;
+    }
     res.json({ ...issue, ancestors, project: project ?? null, goal: goal ?? null, mentionedProjects });
   });
 
