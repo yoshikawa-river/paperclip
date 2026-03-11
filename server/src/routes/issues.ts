@@ -25,7 +25,13 @@ import {
 import { logger } from "../middleware/logger.js";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import {
+  shouldWakeParentOnChildIssueComment,
+  shouldWakeParentOnChildIssueUpdate,
+} from "./issues-child-wakeup.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
+import { canAgentCloseIssueWithComment } from "./issues-done-guard.js";
+import { shouldWakeAssigneeOnIssueUpdate } from "./issues-update-wakeup.js";
 
 const MAX_ATTACHMENT_BYTES = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES) || 10 * 1024 * 1024;
 const ALLOWED_ATTACHMENT_CONTENT_TYPES = new Set([
@@ -227,6 +233,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       status: req.query.status as string | undefined,
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
       assigneeUserId,
+      parentId: req.query.parentId as string | undefined,
       touchedByUserId,
       unreadForUserId,
       projectId: req.query.projectId as string | undefined,
@@ -531,6 +538,20 @@ export function issueRoutes(db: Db, storage: StorageService) {
     }
     if (!(await assertAgentRunCheckoutOwnership(req, res, existing))) return;
 
+    if (
+      req.actor.type === "agent" &&
+      req.body.status === "done" &&
+      !canAgentCloseIssueWithComment({
+        issueDescription: existing.description,
+        doneComment: req.body.comment,
+      })
+    ) {
+      res.status(422).json({
+        error: "Agent close rejected: done transition requires an evidence-bearing completion comment",
+      });
+      return;
+    }
+
     const { comment: commentBody, hiddenAt: hiddenAtRaw, ...updateFields } = req.body;
     if (hiddenAtRaw !== undefined) {
       updateFields.hiddenAt = hiddenAtRaw ? new Date(hiddenAtRaw) : null;
@@ -626,6 +647,14 @@ export function issueRoutes(db: Db, storage: StorageService) {
       existing.status === "backlog" &&
       issue.status !== "backlog" &&
       req.body.status !== undefined;
+    const shouldWakeAssigneeForUpdate = shouldWakeAssigneeOnIssueUpdate({
+      actorType: req.actor.type,
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
+      issueAssigneeId: issue.assigneeAgentId,
+      existingStatus: existing.status,
+      nextStatus: issue.status,
+      hasComment: Boolean(commentBody),
+    });
 
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
     void (async () => {
@@ -655,6 +684,29 @@ export function issueRoutes(db: Db, storage: StorageService) {
         });
       }
 
+      if (!assigneeChanged && shouldWakeAssigneeForUpdate && issue.assigneeAgentId && !wakeups.has(issue.assigneeAgentId)) {
+        wakeups.set(issue.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: commentBody ? "issue_commented" : "issue_status_changed",
+          payload: {
+            issueId: issue.id,
+            mutation: "update",
+            ...(comment ? { commentId: comment.id } : {}),
+            ...(req.body.status !== undefined ? { status: issue.status, previousStatus: existing.status } : {}),
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: issue.id,
+            taskId: issue.id,
+            ...(comment ? { commentId: comment.id } : {}),
+            source: commentBody ? "issue.update.comment" : "issue.update.status_change",
+            wakeReason: commentBody ? "issue_commented" : "issue_status_changed",
+          },
+        });
+      }
+
       if (commentBody && comment) {
         let mentionedIds: string[] = [];
         try {
@@ -680,6 +732,43 @@ export function issueRoutes(db: Db, storage: StorageService) {
               wakeCommentId: comment.id,
               wakeReason: "issue_comment_mentioned",
               source: "comment.mention",
+            },
+          });
+        }
+      }
+
+      if (
+        issue.parentId &&
+        shouldWakeParentOnChildIssueUpdate({
+          actorType: actor.actorType,
+          actorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+          childAssigneeId: issue.assigneeAgentId,
+          existingStatus: existing.status,
+          nextStatus: issue.status,
+        })
+      ) {
+        const parentIssue = await svc.getById(issue.parentId);
+        const parentAssigneeId = parentIssue?.assigneeAgentId ?? null;
+        if (parentAssigneeId && parentAssigneeId !== actor.actorId && !wakeups.has(parentAssigneeId)) {
+          wakeups.set(parentAssigneeId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_commented",
+            payload: {
+              issueId: parentIssue!.id,
+              commentId: comment?.id ?? null,
+              childIssueId: issue.id,
+              mutation: "child_update",
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: parentIssue!.id,
+              taskId: parentIssue!.id,
+              commentId: comment?.id ?? null,
+              childIssueId: issue.id,
+              source: "issue.child_update",
+              wakeReason: "issue_commented",
             },
           });
         }
@@ -1056,6 +1145,42 @@ export function issueRoutes(db: Db, storage: StorageService) {
             source: "comment.mention",
           },
         });
+      }
+
+      if (
+        currentIssue.parentId &&
+        shouldWakeParentOnChildIssueComment({
+          actorType: actor.actorType,
+          actorAgentId: actorIsAgent ? actor.actorId : null,
+          childAssigneeId: currentIssue.assigneeAgentId,
+          reopened,
+        })
+      ) {
+        const parentIssue = await svc.getById(currentIssue.parentId);
+        const parentAssigneeId = parentIssue?.assigneeAgentId ?? null;
+        if (parentAssigneeId && parentAssigneeId !== actor.actorId && !wakeups.has(parentAssigneeId)) {
+          wakeups.set(parentAssigneeId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_commented",
+            payload: {
+              issueId: parentIssue!.id,
+              commentId: comment.id,
+              childIssueId: currentIssue.id,
+              mutation: "child_comment",
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: parentIssue!.id,
+              taskId: parentIssue!.id,
+              commentId: comment.id,
+              childIssueId: currentIssue.id,
+              source: "issue.child_comment",
+              wakeReason: "issue_commented",
+            },
+          });
+        }
       }
 
       for (const [agentId, wakeup] of wakeups.entries()) {

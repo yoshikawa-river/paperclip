@@ -50,6 +50,7 @@ export interface IssueFilters {
   status?: string;
   assigneeAgentId?: string;
   assigneeUserId?: string;
+  parentId?: string;
   touchedByUserId?: string;
   unreadForUserId?: string;
   projectId?: string;
@@ -450,6 +451,13 @@ export function issueService(db: Db) {
       }
       if (filters?.assigneeUserId) {
         conditions.push(eq(issues.assigneeUserId, filters.assigneeUserId));
+      }
+      if (filters?.parentId !== undefined) {
+        if (filters.parentId === "null") {
+          conditions.push(isNull(issues.parentId));
+        } else {
+          conditions.push(eq(issues.parentId, filters.parentId));
+        }
       }
       if (touchedByUserId) {
         conditions.push(touchedByUserCondition(companyId, touchedByUserId));
@@ -912,6 +920,43 @@ export function issueService(db: Db) {
         actorRunId &&
         current.status === "in_progress" &&
         current.assigneeAgentId === actorAgentId &&
+        current.checkoutRunId == null
+      ) {
+        const adopted = await db
+          .update(issues)
+          .set({
+            checkoutRunId: actorRunId,
+            executionRunId: actorRunId,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, id),
+              eq(issues.status, "in_progress"),
+              eq(issues.assigneeAgentId, actorAgentId),
+              isNull(issues.checkoutRunId),
+            ),
+          )
+          .returning({
+            id: issues.id,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+          })
+          .then((rows) => rows[0] ?? null);
+
+        if (adopted) {
+          return {
+            ...adopted,
+            adoptedFromRunId: null as string | null,
+          };
+        }
+      }
+
+      if (
+        actorRunId &&
+        current.status === "in_progress" &&
+        current.assigneeAgentId === actorAgentId &&
         current.checkoutRunId &&
         current.checkoutRunId !== actorRunId
       ) {
@@ -1016,7 +1061,7 @@ export function issueService(db: Db) {
         .select()
         .from(issueComments)
         .where(eq(issueComments.issueId, issueId))
-        .orderBy(desc(issueComments.createdAt)),
+        .orderBy(asc(issueComments.createdAt)),
 
     getComment: (commentId: string) =>
       db

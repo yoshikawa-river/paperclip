@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
+  decideIssueAutoRequeue,
+  pickTimerIssueIdForAgentOpenIssues,
   resolveRuntimeSessionParamsForWorkspace,
+  shouldAlwaysResetTaskSessionForAgent,
   shouldResetTaskSessionForWake,
+  shouldResetTaskSessionForRecentRunStatuses,
+  taskSessionTimeoutResetThreshold,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 
@@ -93,6 +98,10 @@ describe("shouldResetTaskSessionForWake", () => {
     expect(shouldResetTaskSessionForWake({ wakeReason: "issue_assigned" })).toBe(true);
   });
 
+  it("resets session context on checkout wake", () => {
+    expect(shouldResetTaskSessionForWake({ wakeReason: "issue_checked_out" })).toBe(true);
+  });
+
   it("resets session context on timer heartbeats", () => {
     expect(shouldResetTaskSessionForWake({ wakeSource: "timer" })).toBe(true);
   });
@@ -139,5 +148,137 @@ describe("shouldResetTaskSessionForWake", () => {
         wakeTriggerDetail: "callback",
       }),
     ).toBe(false);
+  });
+});
+
+describe("task session timeout reset policy", () => {
+  it("always resets session context for manager-style heartbeat agents", () => {
+    expect(shouldAlwaysResetTaskSessionForAgent({ role: "pm", name: "Chief of Staff" })).toBe(true);
+    expect(shouldAlwaysResetTaskSessionForAgent({ role: "ceo", name: "CEO / Board" })).toBe(true);
+    expect(shouldAlwaysResetTaskSessionForAgent({ role: "worker", name: "Strategy Lead" })).toBe(false);
+  });
+
+  it("uses a lower timeout threshold for manager-style agents", () => {
+    expect(taskSessionTimeoutResetThreshold({ role: "manager", name: "Chief of Staff" })).toBe(1);
+    expect(taskSessionTimeoutResetThreshold({ role: "worker", name: "Builder" })).toBe(2);
+  });
+
+  it("resets after one timeout for manager-style agents", () => {
+    expect(shouldResetTaskSessionForRecentRunStatuses(["timed_out"], 1)).toBe(true);
+  });
+
+  it("requires two consecutive timeouts for non-manager agents", () => {
+    expect(shouldResetTaskSessionForRecentRunStatuses(["timed_out"], 2)).toBe(false);
+    expect(shouldResetTaskSessionForRecentRunStatuses(["timed_out", "timed_out"], 2)).toBe(true);
+    expect(shouldResetTaskSessionForRecentRunStatuses(["timed_out", "failed"], 2)).toBe(false);
+  });
+});
+
+describe("issue auto requeue policy", () => {
+  it("auto requeues process_lost for still-open assigned issues", () => {
+    expect(
+      decideIssueAutoRequeue({
+        outcome: "failed",
+        runErrorCode: "process_lost",
+        retryCount: 0,
+        issueStatus: "in_progress",
+        issueAssigneeId: "agent-1",
+        agentId: "agent-1",
+        materialActionCount: 0,
+      }),
+    ).toBe("process_lost");
+  });
+
+  it("auto requeues no-op succeeded runs when the issue did not move", () => {
+    expect(
+      decideIssueAutoRequeue({
+        outcome: "succeeded",
+        runErrorCode: null,
+        retryCount: 0,
+        issueStatus: "todo",
+        issueAssigneeId: "agent-1",
+        agentId: "agent-1",
+        materialActionCount: 0,
+      }),
+    ).toBe("no_op_success");
+  });
+
+  it("does not auto requeue succeeded runs that produced material actions", () => {
+    expect(
+      decideIssueAutoRequeue({
+        outcome: "succeeded",
+        runErrorCode: null,
+        retryCount: 0,
+        issueStatus: "todo",
+        issueAssigneeId: "agent-1",
+        agentId: "agent-1",
+        materialActionCount: 1,
+      }),
+    ).toBeNull();
+  });
+
+  it("does not auto requeue when retry budget is exhausted or issue is closed", () => {
+    expect(
+      decideIssueAutoRequeue({
+        outcome: "failed",
+        runErrorCode: "process_lost",
+        retryCount: 2,
+        issueStatus: "in_progress",
+        issueAssigneeId: "agent-1",
+        agentId: "agent-1",
+        materialActionCount: 0,
+      }),
+    ).toBeNull();
+    expect(
+      decideIssueAutoRequeue({
+        outcome: "failed",
+        runErrorCode: "process_lost",
+        retryCount: 0,
+        issueStatus: "done",
+        issueAssigneeId: "agent-1",
+        agentId: "agent-1",
+        materialActionCount: 0,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("timer issue selection", () => {
+  it("prefers the root issue for the freshest open chain", () => {
+    expect(
+      pickTimerIssueIdForAgentOpenIssues([
+        {
+          id: "parent-1",
+          parentId: null,
+          priority: "medium",
+          updatedAt: new Date("2026-03-11T13:51:43Z"),
+        },
+        {
+          id: "child-1",
+          parentId: "parent-1",
+          priority: "high",
+          updatedAt: new Date("2026-03-11T13:59:05Z"),
+        },
+      ]),
+    ).toBe("parent-1");
+  });
+
+  it("prefers higher-priority unrelated roots", () => {
+    expect(
+      pickTimerIssueIdForAgentOpenIssues([
+        {
+          id: "root-medium",
+          parentId: null,
+          priority: "medium",
+          updatedAt: new Date("2026-03-11T13:59:05Z"),
+        },
+        {
+          id: "root-high",
+          parentId: null,
+          priority: "high",
+          updatedAt: new Date("2026-03-11T13:40:00Z"),
+        },
+      ]),
+    ).toBe("root-high");
   });
 });

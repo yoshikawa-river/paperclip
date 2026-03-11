@@ -1,12 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
   agentRuntimeState,
   agentTaskSessions,
   agentWakeupRequests,
+  activityLog,
   heartbeatRunEvents,
   heartbeatRuns,
   costEvents,
@@ -28,6 +29,7 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const AUTO_REQUEUE_MAX_ATTEMPTS = 2;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 
@@ -200,6 +202,7 @@ export function shouldResetTaskSessionForWake(
 ) {
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned") return true;
+  if (wakeReason === "issue_checked_out") return true;
 
   const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
   if (wakeSource === "timer") return true;
@@ -208,11 +211,51 @@ export function shouldResetTaskSessionForWake(
   return wakeSource === "on_demand" && wakeTriggerDetail === "manual";
 }
 
+export function taskSessionTimeoutResetThreshold(agent: {
+  role?: string | null | undefined;
+  name?: string | null | undefined;
+}) {
+  const role = readNonEmptyString(agent.role)?.toLowerCase();
+  const nameKey = normalizeAgentNameKey(agent.name);
+  if (role === "manager" || nameKey === "chief of staff" || nameKey === "chief-of-staff") {
+    return 1;
+  }
+  return 2;
+}
+
+export function shouldAlwaysResetTaskSessionForAgent(agent: {
+  role?: string | null | undefined;
+  name?: string | null | undefined;
+}) {
+  const role = readNonEmptyString(agent.role)?.toLowerCase();
+  const nameKey = normalizeAgentNameKey(agent.name);
+  return (
+    role === "pm" ||
+    role === "ceo" ||
+    role === "manager" ||
+    nameKey === "chief of staff" ||
+    nameKey === "chief-of-staff" ||
+    nameKey === "ceo / board" ||
+    nameKey === "ceo-board"
+  );
+}
+
+export function shouldResetTaskSessionForRecentRunStatuses(
+  statuses: Array<string | null | undefined>,
+  threshold: number,
+) {
+  if (!Number.isFinite(threshold) || threshold <= 0) return false;
+  const recent = statuses.slice(0, threshold);
+  if (recent.length < threshold) return false;
+  return recent.every((status) => status === "timed_out");
+}
+
 function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
+  if (wakeReason === "issue_checked_out") return "wake reason is issue_checked_out";
 
   const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
   if (wakeSource === "timer") return "wake source is timer";
@@ -222,6 +265,109 @@ function describeSessionResetReason(
     return "this is a manual invoke";
   }
   return null;
+}
+
+function describeTimeoutSessionResetReason(threshold: number) {
+  return threshold <= 1
+    ? "the previous run for this task timed out"
+    : `the previous ${threshold} runs for this task timed out`;
+}
+
+function describeAgentRoleSessionResetReason() {
+  return "this agent uses fresh sessions for heartbeat runs";
+}
+
+function readAutoRetryCount(contextSnapshot: Record<string, unknown> | null | undefined) {
+  const raw = contextSnapshot?.autoRetryCount;
+  if (typeof raw === "number" && Number.isFinite(raw)) return Math.max(0, Math.floor(raw));
+  if (typeof raw === "string") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) return Math.max(0, Math.floor(parsed));
+  }
+  return 0;
+}
+
+export function decideIssueAutoRequeue(input: {
+  outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
+  runErrorCode: string | null | undefined;
+  retryCount: number;
+  issueStatus: string | null | undefined;
+  issueAssigneeId: string | null | undefined;
+  agentId: string;
+  materialActionCount: number;
+}) {
+  const {
+    outcome,
+    runErrorCode,
+    retryCount,
+    issueStatus,
+    issueAssigneeId,
+    agentId,
+    materialActionCount,
+  } = input;
+  const isOpenIssue = issueStatus === "todo" || issueStatus === "in_progress" || issueStatus === "blocked";
+  if (!isOpenIssue) return null;
+  if (!issueAssigneeId || issueAssigneeId !== agentId) return null;
+  if (retryCount >= AUTO_REQUEUE_MAX_ATTEMPTS) return null;
+
+  if (runErrorCode === "process_lost") {
+    return "process_lost";
+  }
+
+  if (outcome === "succeeded" && materialActionCount <= 0) {
+    return "no_op_success";
+  }
+
+  return null;
+}
+
+type TimerIssueCandidate = {
+  id: string;
+  parentId: string | null;
+  priority: string | null | undefined;
+  updatedAt: Date | null | undefined;
+};
+
+function issuePriorityRank(priority: string | null | undefined) {
+  switch (priority) {
+    case "critical":
+      return 0;
+    case "high":
+      return 1;
+    case "medium":
+      return 2;
+    case "low":
+      return 3;
+    default:
+      return 4;
+  }
+}
+
+export function pickTimerIssueIdForAgentOpenIssues<T extends TimerIssueCandidate>(issuesForAgent: T[]): string | null {
+  if (issuesForAgent.length === 0) return null;
+  const byId = new Map(issuesForAgent.map((issue) => [issue.id, issue]));
+  const rootTouch = new Map<string, number>();
+
+  for (const issue of issuesForAgent) {
+    let root = issue;
+    const seen = new Set<string>([issue.id]);
+    while (root.parentId && byId.has(root.parentId) && !seen.has(root.parentId)) {
+      seen.add(root.parentId);
+      root = byId.get(root.parentId)!;
+    }
+    const touch = issue.updatedAt?.getTime() ?? 0;
+    rootTouch.set(root.id, Math.max(rootTouch.get(root.id) ?? 0, touch));
+  }
+
+  const roots = Array.from(rootTouch.keys())
+    .map((id) => byId.get(id)!)
+    .sort((a, b) => {
+      const priorityDiff = issuePriorityRank(a.priority) - issuePriorityRank(b.priority);
+      if (priorityDiff !== 0) return priorityDiff;
+      return (rootTouch.get(b.id) ?? 0) - (rootTouch.get(a.id) ?? 0);
+    });
+
+  return roots[0]?.id ?? null;
 }
 
 function deriveCommentId(
@@ -429,6 +575,158 @@ export function heartbeatService(db: Db) {
       .from(agentRuntimeState)
       .where(eq(agentRuntimeState.agentId, agentId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function recentTaskRunStatuses(
+    companyId: string,
+    agentId: string,
+    taskKey: string,
+    limit: number,
+  ) {
+    if (limit <= 0) return [];
+    return db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          sql`(
+            ${heartbeatRuns.contextSnapshot} ->> 'taskKey' = ${taskKey}
+            or ${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${taskKey}
+            or ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${taskKey}
+          )`,
+          isNotNull(heartbeatRuns.finishedAt),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(limit)
+      .then((rows) => rows.map((row) => row.status));
+  }
+
+  async function maybeAutoRequeueIssueRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    agent: typeof agents.$inferSelect;
+    outcome: "succeeded" | "failed" | "cancelled" | "timed_out";
+    issueSnapshot?: {
+      id: string;
+      status: string | null;
+      assigneeAgentId: string | null;
+      updatedAt: Date | null;
+    } | null;
+  }) {
+    const { run, agent, outcome, issueSnapshot } = input;
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    if (!issueId) return null;
+
+    const issue =
+      issueSnapshot ??
+      (await db
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          updatedAt: issues.updatedAt,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+        .then((rows) => rows[0] ?? null));
+    if (!issue) return null;
+
+    const retryCount = readAutoRetryCount(context);
+    const materialActionCount = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, run.companyId),
+          eq(activityLog.runId, run.id),
+          inArray(activityLog.action, [
+            "issue.updated",
+            "issue.comment_added",
+            "issue.created",
+            "issue.deleted",
+            "issue.approval_linked",
+            "issue.approval_unlinked",
+            "issue.attachment_added",
+            "issue.attachment_removed",
+            "heartbeat.invoked",
+            "heartbeat.cancelled",
+          ]),
+        ),
+      )
+      .then((rows) => Number(rows[0]?.count ?? 0));
+    const reason = decideIssueAutoRequeue({
+      outcome,
+      runErrorCode: run.errorCode,
+      retryCount,
+      issueStatus: issue.status,
+      issueAssigneeId: issue.assigneeAgentId,
+      agentId: agent.id,
+      materialActionCount,
+    });
+    if (!reason) return null;
+
+    return enqueueWakeup(agent.id, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_auto_requeue",
+      payload: {
+        issueId: issue.id,
+        previousRunId: run.id,
+        autoRetryReason: reason,
+        autoRetryCount: retryCount + 1,
+      },
+      requestedByActorType: "system",
+      requestedByActorId: "heartbeat_auto_requeue",
+      contextSnapshot: {
+        issueId: issue.id,
+        taskId: issue.id,
+        taskKey: issue.id,
+        source: "issue.auto_requeue",
+        wakeReason: "issue_auto_requeue",
+        autoRetryReason: reason,
+        autoRetryCount: retryCount + 1,
+        previousRunId: run.id,
+      },
+    });
+  }
+
+  async function getIssueSnapshotForAutoRequeue(run: typeof heartbeatRuns.$inferSelect) {
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    if (!issueId) return null;
+    return db
+      .select({
+        id: issues.id,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function getTimerIssueHint(agent: typeof agents.$inferSelect) {
+    const openIssues = await db
+      .select({
+        id: issues.id,
+        parentId: issues.parentId,
+        priority: issues.priority,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, agent.companyId),
+          eq(issues.assigneeAgentId, agent.id),
+          inArray(issues.status, ["todo", "in_progress", "blocked"]),
+          sql`${issues.hiddenAt} is null`,
+        ),
+      );
+    return pickTimerIssueIdForAgentOpenIssues(openIssues);
   }
 
   async function getTaskSession(
@@ -926,6 +1224,7 @@ export function heartbeatService(db: Db) {
       });
       const updatedRun = await getRun(run.id);
       if (updatedRun) {
+        const issueSnapshot = await getIssueSnapshotForAutoRequeue(updatedRun);
         await appendRunEvent(updatedRun, 1, {
           eventType: "lifecycle",
           stream: "system",
@@ -933,6 +1232,15 @@ export function heartbeatService(db: Db) {
           message: "Process lost -- server may have restarted",
         });
         await releaseIssueExecutionAndPromote(updatedRun);
+        const agent = await getAgent(updatedRun.agentId);
+        if (agent) {
+          await maybeAutoRequeueIssueRun({
+            run: updatedRun,
+            agent,
+            outcome: "failed",
+            issueSnapshot,
+          });
+        }
       }
       await finalizeAgentStatus(run.agentId, "failed");
       await startNextQueuedRunForAgent(run.agentId);
@@ -1033,6 +1341,14 @@ export function heartbeatService(db: Db) {
     });
   }
 
+  async function safeStartNextQueuedRunForAgent(agentId: string, context: string) {
+    try {
+      await startNextQueuedRunForAgent(agentId);
+    } catch (err) {
+      logger.warn({ err, agentId, context }, "failed to start next queued heartbeat run");
+    }
+  }
+
   async function executeRun(runId: string) {
     let run = await getRun(runId);
     if (!run) return;
@@ -1087,8 +1403,34 @@ export function heartbeatService(db: Db) {
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
       : null;
-    const resetTaskSession = shouldResetTaskSessionForWake(context);
-    const sessionResetReason = describeSessionResetReason(context);
+    const wakeTriggeredSessionReset = shouldResetTaskSessionForWake(context);
+    const roleTriggeredSessionReset = shouldAlwaysResetTaskSessionForAgent(agent);
+    const timeoutResetThreshold = taskSessionTimeoutResetThreshold(agent);
+    const timeoutTriggeredSessionReset =
+      Boolean(taskSession && taskKey) &&
+      shouldResetTaskSessionForRecentRunStatuses(
+        await recentTaskRunStatuses(
+          agent.companyId,
+          agent.id,
+          taskKey ?? "",
+          timeoutResetThreshold,
+        ),
+        timeoutResetThreshold,
+      );
+    if ((roleTriggeredSessionReset || timeoutTriggeredSessionReset) && taskKey) {
+      await clearTaskSessions(agent.companyId, agent.id, {
+        taskKey,
+        adapterType: agent.adapterType,
+      });
+    }
+    const resetTaskSession =
+      wakeTriggeredSessionReset || roleTriggeredSessionReset || timeoutTriggeredSessionReset;
+    const sessionResetReason =
+      describeSessionResetReason(context) ??
+      (roleTriggeredSessionReset ? describeAgentRoleSessionResetReason() : null) ??
+      (timeoutTriggeredSessionReset
+        ? describeTimeoutSessionResetReason(timeoutResetThreshold)
+        : null);
     const taskSessionForRun = resetTaskSession ? null : taskSession;
     const previousSessionParams = normalizeSessionParams(
       sessionCodec.deserialize(taskSessionForRun?.sessionParamsJson ?? null),
@@ -1360,6 +1702,7 @@ export function heartbeatService(db: Db) {
 
       const finalizedRun = await getRun(run.id);
       if (finalizedRun) {
+        const issueSnapshot = await getIssueSnapshotForAutoRequeue(finalizedRun);
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
@@ -1371,6 +1714,12 @@ export function heartbeatService(db: Db) {
           },
         });
         await releaseIssueExecutionAndPromote(finalizedRun);
+        await maybeAutoRequeueIssueRun({
+          run: finalizedRun,
+          agent,
+          outcome,
+          issueSnapshot,
+        });
       }
 
       if (finalizedRun) {
@@ -1427,6 +1776,7 @@ export function heartbeatService(db: Db) {
       });
 
       if (failedRun) {
+        const issueSnapshot = await getIssueSnapshotForAutoRequeue(failedRun);
         await appendRunEvent(failedRun, seq++, {
           eventType: "error",
           stream: "system",
@@ -1434,6 +1784,12 @@ export function heartbeatService(db: Db) {
           message,
         });
         await releaseIssueExecutionAndPromote(failedRun);
+        await maybeAutoRequeueIssueRun({
+          run: failedRun,
+          agent,
+          outcome: "failed",
+          issueSnapshot,
+        });
 
         await updateRuntimeState(agent, failedRun, {
           exitCode: null,
@@ -1613,7 +1969,7 @@ export function heartbeatService(db: Db) {
       },
     });
 
-    await startNextQueuedRunForAgent(promotedRun.agentId);
+    await safeStartNextQueuedRunForAgent(promotedRun.agentId, "release_issue_execution_and_promote");
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
@@ -1957,7 +2313,7 @@ export function heartbeatService(db: Db) {
         },
       });
 
-      await startNextQueuedRunForAgent(agent.id);
+      await safeStartNextQueuedRunForAgent(agent.id, "enqueue_wakeup_issue_locked");
       return newRun;
     }
 
@@ -2067,7 +2423,7 @@ export function heartbeatService(db: Db) {
       },
     });
 
-    await startNextQueuedRunForAgent(agent.id);
+    await safeStartNextQueuedRunForAgent(agent.id, "enqueue_wakeup");
 
     return newRun;
   }
@@ -2221,13 +2577,17 @@ export function heartbeatService(db: Db) {
         const elapsedMs = now.getTime() - baseline;
         if (elapsedMs < policy.intervalSec * 1000) continue;
 
+        const issueId = await getTimerIssueHint(agent);
+
         const run = await enqueueWakeup(agent.id, {
           source: "timer",
           triggerDetail: "system",
           reason: "heartbeat_timer",
           requestedByActorType: "system",
           requestedByActorId: "heartbeat_scheduler",
+          payload: issueId ? { issueId } : null,
           contextSnapshot: {
+            ...(issueId ? { issueId, taskId: issueId, taskKey: issueId } : {}),
             source: "scheduler",
             reason: "interval_elapsed",
             now: now.toISOString(),
