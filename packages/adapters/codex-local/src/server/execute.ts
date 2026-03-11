@@ -61,6 +61,10 @@ function resolveCodexBillingType(env: Record<string, string>): "api" | "subscrip
   return hasNonEmptyEnvValue(env, "OPENAI_API_KEY") ? "api" : "subscription";
 }
 
+function shouldRetryFreshAfterTimeout(resumeSessionId: string | null, timedOut: boolean): boolean {
+  return Boolean(resumeSessionId) && timedOut;
+}
+
 function codexHomeDir(): string {
   const fromEnv = process.env.CODEX_HOME;
   if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return fromEnv.trim();
@@ -394,6 +398,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   };
 
   const initial = await runAttempt(sessionId);
+  if (shouldRetryFreshAfterTimeout(sessionId, initial.proc.timedOut)) {
+    await onLog(
+      "stderr",
+      `[paperclip] Codex resume session "${sessionId}" timed out; retrying with a fresh session.\n`,
+    );
+    const retry = await runAttempt(null);
+    return toResult(retry, true);
+  }
+
   if (
     sessionId &&
     !initial.proc.timedOut &&
