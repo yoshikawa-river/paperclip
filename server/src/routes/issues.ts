@@ -27,6 +27,7 @@ import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import { isAllowedContentType, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
+import { safeWakeAgentForIssue } from "../services/safe-wake.js";
 
 export function issueRoutes(db: Db, storage: StorageService) {
   const router = Router();
@@ -56,6 +57,18 @@ export function issueRoutes(db: Db, storage: StorageService) {
         else resolve();
       });
     });
+  }
+
+  function enqueueIssueWake(
+    issueId: string,
+    agentId: string,
+    wakeup: NonNullable<Parameters<typeof heartbeat.wakeup>[1]>,
+    reason: string,
+  ) {
+    void safeWakeAgentForIssue(db, agentId, wakeup, {
+      issueId,
+      enableDirectInvokeFallback: true,
+    }).catch((err) => logger.warn({ err, issueId, agentId }, reason));
   }
 
   async function assertCanManageIssueApprovalLinks(req: Request, res: Response, companyId: string) {
@@ -433,8 +446,10 @@ export function issueRoutes(db: Db, storage: StorageService) {
     });
 
     if (issue.assigneeAgentId && issue.status !== "backlog") {
-      void heartbeat
-        .wakeup(issue.assigneeAgentId, {
+      enqueueIssueWake(
+        issue.id,
+        issue.assigneeAgentId,
+        {
           source: "assignment",
           triggerDetail: "system",
           reason: "issue_assigned",
@@ -442,8 +457,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
           contextSnapshot: { issueId: issue.id, source: "issue.create" },
-        })
-        .catch((err) => logger.warn({ err, issueId: issue.id }, "failed to wake assignee on issue create"));
+        },
+        "failed to wake assignee on issue create",
+      );
     }
 
     res.status(201).json(issue);
@@ -575,7 +591,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
     void (async () => {
-      const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
+      const wakeups = new Map<string, NonNullable<Parameters<typeof heartbeat.wakeup>[1]>>();
 
       if (assigneeChanged && issue.assigneeAgentId && issue.status !== "backlog") {
         wakeups.set(issue.assigneeAgentId, {
@@ -632,9 +648,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       }
 
       for (const [agentId, wakeup] of wakeups.entries()) {
-        heartbeat
-          .wakeup(agentId, wakeup)
-          .catch((err) => logger.warn({ err, issueId: issue.id, agentId }, "failed to wake agent on issue update"));
+        enqueueIssueWake(issue.id, agentId, wakeup, "failed to wake agent on issue update");
       }
     })();
 
@@ -719,8 +733,10 @@ export function issueRoutes(db: Db, storage: StorageService) {
         checkoutRunId,
       })
     ) {
-      void heartbeat
-        .wakeup(req.body.agentId, {
+      enqueueIssueWake(
+        issue.id,
+        req.body.agentId,
+        {
           source: "assignment",
           triggerDetail: "system",
           reason: "issue_checked_out",
@@ -728,8 +744,9 @@ export function issueRoutes(db: Db, storage: StorageService) {
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
           contextSnapshot: { issueId: issue.id, source: "issue.checkout" },
-        })
-        .catch((err) => logger.warn({ err, issueId: issue.id }, "failed to wake assignee on issue checkout"));
+        },
+        "failed to wake assignee on issue checkout",
+      );
     }
 
     res.json(updated);
@@ -921,7 +938,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
 
     // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
     void (async () => {
-      const wakeups = new Map<string, Parameters<typeof heartbeat.wakeup>[1]>();
+      const wakeups = new Map<string, NonNullable<Parameters<typeof heartbeat.wakeup>[1]>>();
       const assigneeId = currentIssue.assigneeAgentId;
       const actorIsAgent = actor.actorType === "agent";
       const selfComment = actorIsAgent && actor.actorId === assigneeId;
@@ -1005,9 +1022,7 @@ export function issueRoutes(db: Db, storage: StorageService) {
       }
 
       for (const [agentId, wakeup] of wakeups.entries()) {
-        heartbeat
-          .wakeup(agentId, wakeup)
-          .catch((err) => logger.warn({ err, issueId: currentIssue.id, agentId }, "failed to wake agent on issue comment"));
+        enqueueIssueWake(currentIssue.id, agentId, wakeup, "failed to wake agent on issue comment");
       }
     })();
 

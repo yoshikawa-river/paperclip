@@ -113,6 +113,8 @@ export const ISSUE_STATUSES = [
   "todo",
   "in_progress",
   "in_review",
+  "waiting_for_submission",
+  "waiting_for_children",
   "done",
   "blocked",
   "cancelled",

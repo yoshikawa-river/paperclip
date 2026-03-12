@@ -23,7 +23,17 @@ import {
   parseProjectExecutionWorkspacePolicy,
 } from "./execution-workspace-policy.js";
 
-const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const ALL_ISSUE_STATUSES = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "in_review",
+  "waiting_for_submission",
+  "waiting_for_children",
+  "blocked",
+  "done",
+  "cancelled",
+];
 
 function assertTransition(from: string, to: string) {
   if (from === to) return;
@@ -419,6 +429,51 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
 
     return adopted;
+  }
+
+  async function repairExecutionState(issueId: string) {
+    const issue = await db
+      .select({
+        id: issues.id,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+
+    if (!issue) return { repaired: false, reason: "issue_not_found", executionRunId: null as string | null };
+    if (!issue.executionRunId) return { repaired: false, reason: "no_execution_lock", executionRunId: null as string | null };
+
+    const run = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, issue.executionRunId))
+      .then((rows) => rows[0] ?? null);
+    const isActive = run && (run.status === "queued" || run.status === "running");
+    if (isActive) {
+      return { repaired: false, reason: "execution_active", executionRunId: issue.executionRunId };
+    }
+
+    const updated = await db
+      .update(issues)
+      .set({
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(issues.id, issue.id), eq(issues.executionRunId, issue.executionRunId)))
+      .returning({ id: issues.id })
+      .then((rows) => rows[0] ?? null);
+
+    return {
+      repaired: Boolean(updated),
+      reason: run ? `execution_${run.status}` : "execution_missing",
+      executionRunId: issue.executionRunId,
+    };
   }
 
   return {
@@ -964,6 +1019,8 @@ export function issueService(db: Db) {
         actorRunId,
       });
     },
+
+    repairExecutionState,
 
     release: async (id: string, actorAgentId?: string, actorRunId?: string | null) => {
       const existing = await db

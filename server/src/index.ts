@@ -117,6 +117,7 @@ export async function startServer(): Promise<StartedServer> {
     label: string,
     opts?: EnsureMigrationsOptions,
   ): Promise<MigrationSummary> {
+    const strictMigrationGate = process.env.PAPERCLIP_MIGRATION_STRICT !== "false";
     const autoApply = opts?.autoApply === true;
     let state = await inspectMigrations(connectionString);
     if (state.status === "needsMigrations" && state.reason === "pending-migrations") {
@@ -138,6 +139,11 @@ export async function startServer(): Promise<StartedServer> {
       );
       const apply = autoApply ? true : await promptApplyMigrations(state.pendingMigrations);
       if (!apply) {
+        if (strictMigrationGate) {
+          throw new Error(
+            `${label} has pending migrations and startup strict mode is enabled. Run pnpm db:migrate or set PAPERCLIP_MIGRATION_STRICT=false to bypass.`,
+          );
+        }
         logger.warn(
           { pendingMigrations: state.pendingMigrations },
           `${label} has pending migrations; continuing without applying. Run pnpm db:migrate to apply before startup.`,
@@ -152,6 +158,11 @@ export async function startServer(): Promise<StartedServer> {
   
     const apply = autoApply ? true : await promptApplyMigrations(state.pendingMigrations);
     if (!apply) {
+      if (strictMigrationGate) {
+        throw new Error(
+          `${label} has pending migrations and startup strict mode is enabled. Run pnpm db:migrate or set PAPERCLIP_MIGRATION_STRICT=false to bypass.`,
+        );
+      }
       logger.warn(
         { pendingMigrations: state.pendingMigrations },
         `${label} has pending migrations; continuing without applying. Run pnpm db:migrate to apply before startup.`,

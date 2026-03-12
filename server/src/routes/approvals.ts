@@ -11,13 +11,13 @@ import { validate } from "../middleware/validate.js";
 import { logger } from "../middleware/logger.js";
 import {
   approvalService,
-  heartbeatService,
   issueApprovalService,
   logActivity,
   secretService,
 } from "../services/index.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import { redactEventPayload } from "../redaction.js";
+import { safeWakeAgentForIssue } from "../services/safe-wake.js";
 
 function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(approval: T): T {
   return {
@@ -29,7 +29,6 @@ function redactApprovalPayload<T extends { payload: Record<string, unknown> }>(a
 export function approvalRoutes(db: Db) {
   const router = Router();
   const svc = approvalService(db);
-  const heartbeat = heartbeatService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
   const strictSecretsMode = process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true";
@@ -148,28 +147,36 @@ export function approvalRoutes(db: Db) {
 
       if (approval.requestedByAgentId) {
         try {
-          const wakeRun = await heartbeat.wakeup(approval.requestedByAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "approval_approved",
-            payload: {
-              approvalId: approval.id,
-              approvalStatus: approval.status,
-              issueId: primaryIssueId,
-              issueIds: linkedIssueIds,
+          const wakeRun = await safeWakeAgentForIssue(
+            db,
+            approval.requestedByAgentId,
+            {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "approval_approved",
+              payload: {
+                approvalId: approval.id,
+                approvalStatus: approval.status,
+                issueId: primaryIssueId,
+                issueIds: linkedIssueIds,
+              },
+              requestedByActorType: "user",
+              requestedByActorId: req.actor.userId ?? "board",
+              contextSnapshot: {
+                source: "approval.approved",
+                approvalId: approval.id,
+                approvalStatus: approval.status,
+                issueId: primaryIssueId,
+                issueIds: linkedIssueIds,
+                taskId: primaryIssueId,
+                wakeReason: "approval_approved",
+              },
             },
-            requestedByActorType: "user",
-            requestedByActorId: req.actor.userId ?? "board",
-            contextSnapshot: {
-              source: "approval.approved",
-              approvalId: approval.id,
-              approvalStatus: approval.status,
+            {
               issueId: primaryIssueId,
-              issueIds: linkedIssueIds,
-              taskId: primaryIssueId,
-              wakeReason: "approval_approved",
+              enableDirectInvokeFallback: true,
             },
-          });
+          );
 
           await logActivity(db, {
             companyId: approval.companyId,
