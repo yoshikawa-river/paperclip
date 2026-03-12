@@ -528,6 +528,17 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "heartbeat timer tick failed");
         });
+
+      void heartbeat
+        .runIssueWatchdog(new Date())
+        .then((result) => {
+          if (result.repaired > 0) {
+            logger.warn({ ...result }, "issue watchdog applied automatic recovery");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "issue watchdog failed");
+        });
   
       // Periodically reap orphaned runs (5-min staleness threshold)
       void heartbeat

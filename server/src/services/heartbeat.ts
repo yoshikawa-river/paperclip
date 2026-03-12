@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -44,6 +44,8 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+const ISSUE_WATCHDOG_STALE_MINUTES = 10;
+const ISSUE_WATCHDOG_COOLDOWN_MINUTES = 30;
 const startLocksByAgent = new Map<string, Promise<void>>();
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 
@@ -349,6 +351,19 @@ function mergeCoalescedContextSnapshot(
 
 function runTaskKey(run: typeof heartbeatRuns.$inferSelect) {
   return deriveTaskKey(run.contextSnapshot as Record<string, unknown> | null, null);
+}
+
+function shouldWatchdogRecoverIssue(input: {
+  now: Date;
+  issueUpdatedAt: Date | null;
+  hasActiveRun: boolean;
+  assigneeStatus?: string | null;
+}) {
+  if (input.hasActiveRun) return false;
+  if (input.assigneeStatus && input.assigneeStatus !== "idle" && input.assigneeStatus !== "error") return false;
+  const updatedAtMs = input.issueUpdatedAt?.getTime() ?? 0;
+  if (updatedAtMs <= 0) return false;
+  return input.now.getTime() - updatedAtMs >= ISSUE_WATCHDOG_STALE_MINUTES * 60 * 1000;
 }
 
 function isSameTaskScope(left: string | null, right: string | null) {
@@ -2283,6 +2298,126 @@ export function heartbeatService(db: Db) {
     return newRun;
   }
 
+  async function hasRecentWatchdogWake(companyId: string, issueId: string, now: Date) {
+    const windowStart = new Date(now.getTime() - ISSUE_WATCHDOG_COOLDOWN_MINUTES * 60 * 1000);
+    const rows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          gte(heartbeatRuns.createdAt, windowStart),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          sql`coalesce(${heartbeatRuns.contextSnapshot} ->> 'wakeReason', '') = 'watchdog_idle_in_progress_issue'`,
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  }
+
+  async function runIssueWatchdog(now = new Date()) {
+    const openIssues = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.status, "in_progress"),
+          sql`${issues.hiddenAt} is null`,
+          sql`${issues.assigneeAgentId} is not null`,
+        ),
+      );
+
+    if (openIssues.length === 0) {
+      return { checked: 0, repaired: 0, skipped: 0 };
+    }
+
+    const assigneeIds = Array.from(
+      new Set(
+        openIssues
+          .map((issue) => readNonEmptyString(issue.assigneeAgentId))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    );
+
+    const activeRuns = assigneeIds.length
+      ? await db
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            inArray(heartbeatRuns.agentId, assigneeIds),
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+          ),
+        )
+      : [];
+
+    const agentRows = assigneeIds.length
+      ? await db
+        .select({ id: agents.id, status: agents.status })
+        .from(agents)
+        .where(inArray(agents.id, assigneeIds))
+      : [];
+
+    const activeIssueIds = new Set<string>();
+    for (const run of activeRuns) {
+      const key = runTaskKey(run);
+      if (key) activeIssueIds.add(key);
+    }
+
+    const assigneeStatusById = new Map(agentRows.map((row) => [row.id, row.status]));
+
+    let repaired = 0;
+    let skipped = 0;
+    for (const issue of openIssues) {
+      const assigneeId = readNonEmptyString(issue.assigneeAgentId);
+      if (!assigneeId) {
+        skipped += 1;
+        continue;
+      }
+      const shouldRecover = shouldWatchdogRecoverIssue({
+        now,
+        issueUpdatedAt: issue.updatedAt,
+        hasActiveRun: activeIssueIds.has(issue.id),
+        assigneeStatus: assigneeStatusById.get(assigneeId) ?? null,
+      });
+      if (!shouldRecover) {
+        skipped += 1;
+        continue;
+      }
+      if (await hasRecentWatchdogWake(issue.companyId, issue.id, now)) {
+        skipped += 1;
+        continue;
+      }
+
+      const run = await enqueueWakeup(assigneeId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "watchdog_idle_in_progress_issue",
+        payload: { issueId: issue.id },
+        requestedByActorType: "system",
+        requestedByActorId: "issue_watchdog",
+        contextSnapshot: {
+          issueId: issue.id,
+          taskId: issue.id,
+          taskKey: issue.id,
+          source: "issue.watchdog",
+          wakeReason: "watchdog_idle_in_progress_issue",
+          now: now.toISOString(),
+        },
+      });
+
+      if (run) repaired += 1;
+      else skipped += 1;
+    }
+
+    return { checked: openIssues.length, repaired, skipped };
+  }
+
   return {
     list: async (companyId: string, agentId?: string, limit?: number) => {
       const query = db
@@ -2414,6 +2549,7 @@ export function heartbeatService(db: Db) {
       }),
 
     wakeup: enqueueWakeup,
+    runIssueWatchdog,
 
     reapOrphanedRuns,
 
